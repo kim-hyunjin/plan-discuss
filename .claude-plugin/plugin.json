@@ -1,0 +1,30 @@
+{
+  "name": "plan-discuss",
+  "version": "0.1.0",
+  "description": "Plan mode에서 계획서 작성 후 질문/토론 단계를 거친 뒤 /plan-go로 승인하고 auto 모드로 실행하는 mod",
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "approveMode": {
+      "type": "string",
+      "description": "/plan-go 승인 시 전환할 권한 모드. dialog를 고르면 기본 승인 다이얼로그를 그대로 띄움",
+      "default": "auto",
+      "options": [
+        "auto",
+        "acceptEdits",
+        "default",
+        "bypassPermissions",
+        "dialog"
+      ],
+      "title": "승인 후 권한 모드"
+    },
+    "interceptExit": {
+      "type": "boolean",
+      "description": "계획서가 작성되고 모델이 처음 ExitPlanMode를 호출할 때 승인 다이얼로그 대신 토론 모드로 들어갈지",
+      "default": true,
+      "title": "첫 ExitPlanMode를 토론 모드로 가로채기"
+    }
+  },
+  "author": {
+    "name": "kim-hyunjin"
+  }
+}

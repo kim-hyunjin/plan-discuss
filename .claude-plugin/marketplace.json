@@ -1,0 +1,13 @@
+{
+  "name": "plan-discuss",
+  "owner": {
+    "name": "kim-hyunjin"
+  },
+  "plugins": [
+    {
+      "name": "plan-discuss",
+      "source": "./"
+    }
+  ],
+  "description": "Claude Code mod: plan 모드 계획서 토론 단계 (plan-discuss)"
+}
