@@ -1,6 +1,6 @@
 {
   "name": "plan-discuss",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Plan mode에서 계획서 작성 후 질문/토론 단계를 거친 뒤 /plan-go로 승인하고 auto 모드로 실행하는 mod",
   "types": "./types/index.d.ts",
   "userConfig": {
@@ -22,6 +22,25 @@
       "description": "계획서가 작성되고 모델이 처음 ExitPlanMode를 호출할 때 승인 다이얼로그 대신 토론 모드로 들어갈지",
       "default": true,
       "title": "첫 ExitPlanMode를 토론 모드로 가로채기"
+    },
+    "showPlan": {
+      "type": "string",
+      "description": "토론 모드로 들어갈 때 대화창에 계획서를 어떻게 보여줄지. full은 계획서 전문, summary는 목표·접근·단계·열린 질문 요약, off는 안 보여줌",
+      "default": "full",
+      "options": ["full", "summary", "off"],
+      "title": "토론 모드 진입 시 계획서 표시"
+    },
+    "discussModel": {
+      "type": "string",
+      "description": "계획 토론 단계에서 쓸 모델 (예: sonnet, opus, haiku 또는 전체 id). 비우면 세션 모델 그대로. 토론을 벗어나면 원래 모델로 되돌림",
+      "default": "",
+      "title": "토론 단계 모델"
+    },
+    "editModel": {
+      "type": "string",
+      "description": "계획 수정 단계에서 쓸 모델. 비우면 세션 모델 그대로",
+      "default": "",
+      "title": "수정 단계 모델"
     }
   },
   "author": {

@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { PlanDiscussPhase } from '../types'
+import type { PlanDiscussPhase, PlanModelOverrides } from '../types'
 
 
 const phase = atom({ plugin: 'plan-discuss', key: 'phase' } as const, 'off' as PlanDiscussPhase)
@@ -9,6 +9,15 @@ const inPlan = atom({ plugin: 'plan-discuss', key: 'inPlan' } as const, false)
 const planFile = atom({ plugin: 'plan-discuss', key: 'planFile' } as const, null as string | null)
 const returnToDiscuss = atom({ plugin: 'plan-discuss', key: 'returnToDiscuss' } as const, false)
 const isHidden = atom({ plugin: 'plan-discuss', key: 'isHidden' } as const, false)
+/** mod가 /model로 바꿔 둔 모델 (alias 그대로); null이면 바꾼 적 없음 */
+const appliedModel = atom({ plugin: 'plan-discuss', key: 'appliedModel' } as const, null as string | null)
+/** mod가 처음 모델을 바꾸기 전의 세션 모델. 토론/수정을 벗어나면 이걸로 되돌린다 */
+const savedModel = atom({ plugin: 'plan-discuss', key: 'savedModel' } as const, null as string | null)
+/** /plan-model 로 이 세션에서 고른 단계별 모델 (설정값보다 우선) */
+const modelOverrides = atom(
+  { plugin: 'plan-discuss', key: 'modelOverrides' } as const,
+  { discuss: null, edit: null } as PlanModelOverrides,
+)
 
 const EDIT_TOOLS = /^(Write|Edit|MultiEdit|NotebookEdit)$/
 
@@ -39,13 +48,90 @@ async function showStatus($: Pick<EngineInterface, 'ui' | 'state'>): Promise<voi
   $.ui.status(label)
 }
 
+type PhaseModels = { discuss: string; edit: string }
+type Engine$ = Pick<EngineInterface, 'ui' | 'state' | 'clock' | 'command' | 'session'>
+
+/** 단계에 맞는 모델 이름 (빈 문자열이면 바꾸지 않음) */
+async function modelFor($: Pick<EngineInterface, 'state'>, ph: PlanDiscussPhase, cfg: PhaseModels): Promise<string> {
+  if (ph !== 'discuss' && ph !== 'edit') return ''
+  const ov = await read($, modelOverrides)
+  return (ov[ph] ?? cfg[ph]).trim()
+}
+
+async function runModelCommand($: Pick<EngineInterface, 'ui' | 'command'>, name: string): Promise<void> {
+  const res = await $.command.run({ command: 'model', args: name }).catch((err: unknown) => ({ error: String(err) }))
+  if ('error' in res) $.ui.toast(`plan-discuss: 모델을 ${name}(으)로 바꾸지 못했습니다 (${res.error}). /model ${name} 을 직접 실행하세요.`)
+}
+
+/**
+ * 단계에 맞춰 세션 모델을 맞춘다. 바꿔야 할 게 있으면 그 작업(아직 실행 전)을 돌려준다.
+ * command.run 훅 안에서는 $.command.run이 거부되므로, 호출한 쪽이 타이머나 프롬프트 전송 앞에서 실행한다.
+ */
+async function syncModel($: Engine$, ph: PlanDiscussPhase, cfg: PhaseModels): Promise<(() => Promise<void>) | null> {
+  const desired = await modelFor($, ph, cfg)
+  const applied = await read($, appliedModel)
+  if (desired !== '') {
+    if (applied === desired) return null
+    if (applied === null) {
+      const current = await $.session.model()
+      await update($, savedModel, () => current)
+    }
+    await update($, appliedModel, () => desired)
+    return () => runModelCommand($, desired)
+  }
+  if (applied === null) return null
+  const back = await read($, savedModel)
+  await update($, appliedModel, () => null)
+  await update($, savedModel, () => null)
+  return back ? () => runModelCommand($, back) : null
+}
+
+/** 단계를 바꾸고 모델을 맞춘다. schedule=false면 모델 전환 작업을 돌려주고 실행은 호출한 쪽에 맡긴다 */
 async function setPhase(
-  $: Pick<EngineInterface, 'ui' | 'state'>,
+  $: Engine$,
   next: PlanDiscussPhase,
-): Promise<void> {
+  cfg: PhaseModels,
+  schedule = true,
+): Promise<(() => Promise<void>) | null> {
   await update($, phase, () => next)
   await update($, isHidden, () => false)
   await showStatus($)
+  const switchModel = await syncModel($, next, cfg)
+  if (switchModel && schedule) {
+    void $.clock.after(50, switchModel)
+    return null
+  }
+  return switchModel
+}
+
+type ShowPlan = 'full' | 'summary' | 'off'
+
+/** 토론 모드로 들어갈 때 모델이 대화창에 계획서를 어떻게 보여줄지 */
+function presentPlanInstruction(show: ShowPlan, file: string | null): string {
+  const where = file ? ` (${file})` : ''
+  if (show === 'full') {
+    return [
+      `Then show the user the plan: print the whole plan file${where} verbatim in the chat as markdown, so the user can read it without opening the file.`,
+      'Do not paraphrase or shorten it, and do not add commentary before it beyond one heading line.',
+    ].join(' ')
+  }
+  if (show === 'summary') {
+    return [
+      `Then show the user how the plan was put together, in the chat: the goal, the approach you chose and why (including alternatives you rejected),`,
+      'the steps in order with the files each one touches, and any open questions or risks. Keep it structured with short headings or bullets.',
+    ].join(' ')
+  }
+  return ''
+}
+
+async function readPlanText($: Pick<EngineInterface, 'fs'>, file: string | null): Promise<string | null> {
+  if (!file) return null
+  try {
+    const text = await $.fs.read(file)
+    return text.trim() === '' ? null : text.trimEnd()
+  } catch {
+    return null
+  }
 }
 
 function approvePrompt(note: string): string {
@@ -65,8 +151,13 @@ function editPrompt(instruction: string): string {
 
 // command.run 훅 안에서 바로 $.prompt.submit을 부르면 프롬프트가 턴을 열지 못하고 사라진다.
 // 명령이 끝난 뒤 타이머에서 보내고, 그래도 들어가지 않으면 입력창에 채워 Enter만 누르게 한다.
-function submitAfterCommand($: Pick<EngineInterface, 'clock' | 'prompt' | 'ui'>, text: string): void {
+function submitAfterCommand(
+  $: Pick<EngineInterface, 'clock' | 'prompt' | 'ui'>,
+  text: string,
+  before: (() => Promise<void>) | null = null,
+): void {
   void $.clock.after(50, async () => {
+    if (before) await before()
     const res = await $.prompt.submit({ text, asUser: true }).catch((err: unknown) => ({ drop: String(err) }))
     if (res.drop !== undefined) {
       await $.prompt.fill({ text })
@@ -78,6 +169,12 @@ function submitAfterCommand($: Pick<EngineInterface, 'clock' | 'prompt' | 'ui'>,
 export const register: Register = (on, options) => {
   const approveMode = String(options.approveMode ?? 'auto')
   const interceptExit = options.interceptExit !== false
+  const showPlanRaw = String(options.showPlan ?? 'full')
+  const models: PhaseModels = {
+    discuss: String(options.discussModel ?? ''),
+    edit: String(options.editModel ?? ''),
+  }
+  const showPlan: ShowPlan = showPlanRaw === 'summary' || showPlanRaw === 'off' ? showPlanRaw : 'full'
 
   // ---- commands --------------------------------------------------------
 
@@ -91,6 +188,11 @@ export const register: Register = (on, options) => {
         name: 'plan-edit',
         description: '계획 수정 모드. 지시를 붙이면 그 지시로 한 번 수정하고 토론 모드로 복귀',
         argumentHint: '[수정 지시]',
+      }),
+      $.command.register({
+        name: 'plan-model',
+        description: '토론/수정 단계에서 쓸 모델 선택. 예: /plan-model sonnet · /plan-model edit opus · /plan-model off',
+        argumentHint: '[discuss|edit] <모델|off>',
       }),
       $.command.register({
         name: 'plan-go',
@@ -107,10 +209,12 @@ export const register: Register = (on, options) => {
       return { text: 'plan-discuss: 지금은 plan 모드가 아닙니다. plan 모드에서 계획서가 작성된 뒤에 쓰세요.' }
     }
     await update($, returnToDiscuss, () => false)
-    await setPhase($, 'discuss')
-    return {
-      text: '💬 계획 토론 모드. 계획서에 대해 자유롭게 질문하세요. 계획서는 수정되지 않습니다. 수정은 /plan-edit, 승인은 /plan-go.',
-    }
+    await setPhase($, 'discuss', models)
+    const head = '💬 계획 토론 모드. 계획서에 대해 자유롭게 질문하세요. 계획서는 수정되지 않습니다. 수정은 /plan-edit, 승인은 /plan-go.'
+    const file = await read($, planFile)
+    const plan = showPlan === 'off' ? null : await readPlanText($, file)
+    if (plan === null) return { text: head }
+    return { text: `${head}\n\n--- 계획서 (${file}) ---\n${plan}` }
   })
 
   on('command.run', { command: 'plan-edit' }, async ($, e) => {
@@ -118,14 +222,41 @@ export const register: Register = (on, options) => {
       return { text: 'plan-discuss: 지금은 plan 모드가 아닙니다.' }
     }
     const instruction = e.args.trim()
-    await setPhase($, 'edit')
     if (instruction === '') {
       await update($, returnToDiscuss, () => false)
+      await setPhase($, 'edit', models)
       return { text: '✎ 계획 수정 모드. 이제 하는 말은 계획서 수정 지시로 처리됩니다. 토론으로 돌아가려면 /plan-talk.' }
     }
     await update($, returnToDiscuss, () => true)
-    submitAfterCommand($, editPrompt(instruction))
+    const switchModel = await setPhase($, 'edit', models, false)
+    submitAfterCommand($, editPrompt(instruction), switchModel)
     return { text: '✎ 계획서를 한 번 수정하고 토론 모드로 돌아옵니다.' }
+  })
+
+  on('command.run', { command: 'plan-model' }, async ($, e) => {
+    const words = e.args.trim().split(/\s+/).filter(Boolean)
+    const ph = await read($, phase)
+    const ov = await read($, modelOverrides)
+    const line = (k: 'discuss' | 'edit') => {
+      const v = ov[k] ?? models[k]
+      return `${k === 'discuss' ? '토론' : '수정'}: ${v.trim() === '' ? '(세션 모델 그대로)' : v}${ov[k] !== null ? ' (세션에서 지정)' : ''}`
+    }
+    if (words.length === 0) {
+      return { text: `plan-discuss 모델 · ${line('discuss')} · ${line('edit')}\n바꾸려면 /plan-model [discuss|edit] <모델|off>` }
+    }
+    let target: 'discuss' | 'edit' = ph === 'edit' ? 'edit' : 'discuss'
+    if (words[0] === 'discuss' || words[0] === 'edit') target = words.shift() as 'discuss' | 'edit'
+    const name = words.join(' ')
+    if (name === '') return { text: 'plan-discuss: 모델 이름을 적어주세요. 예: /plan-model sonnet' }
+    const value = name === 'off' || name === '-' ? null : name
+    await update($, modelOverrides, prev => ({ ...prev, [target]: value }))
+    const label = target === 'discuss' ? '토론' : '수정'
+    if (!(await read($, inPlan)) || ph !== target) {
+      return { text: `plan-discuss: ${label} 단계 모델을 ${value ?? '(설정값)'}(으)로 기억했습니다. 그 단계에 들어가면 적용됩니다.` }
+    }
+    const switchModel = await syncModel($, ph, models)
+    if (switchModel) void $.clock.after(50, switchModel)
+    return { text: `plan-discuss: ${label} 단계 모델 → ${value ?? '(설정값)'}. 지금 적용합니다.` }
   })
 
   on('command.run', { command: 'plan-go' }, async ($, e) => {
@@ -133,8 +264,8 @@ export const register: Register = (on, options) => {
       return { text: 'plan-discuss: 지금은 plan 모드가 아닙니다.' }
     }
     await update($, returnToDiscuss, () => false)
-    await setPhase($, 'approved')
-    submitAfterCommand($, approvePrompt(e.args))
+    const switchModel = await setPhase($, 'approved', models, false)
+    submitAfterCommand($, approvePrompt(e.args), switchModel)
     const how = approveMode === 'dialog' ? '승인 다이얼로그가 뜹니다' : `${approveMode} 모드로 전환되어 구현이 시작됩니다`
     return { text: `▶ 계획 승인. ExitPlanMode 후 ${how}.` }
   })
@@ -157,7 +288,7 @@ export const register: Register = (on, options) => {
     if (e.agentId === undefined) {
       await update($, inPlan, () => false)
       await update($, returnToDiscuss, () => false)
-      await setPhase($, 'off')
+      await setPhase($, 'off', models)
     }
     return next(e)
   })
@@ -167,7 +298,7 @@ export const register: Register = (on, options) => {
     if (e.agentId === undefined && ran.deny === undefined && ran.isError === undefined) {
       await update($, inPlan, () => true)
       await update($, returnToDiscuss, () => false)
-      await setPhase($, 'off')
+      await setPhase($, 'off', models)
     }
     return ran
   })
@@ -183,16 +314,18 @@ export const register: Register = (on, options) => {
     if (mustIntercept) {
       await update($, inPlan, () => true)
       await update($, returnToDiscuss, () => false)
-      await setPhase($, 'discuss')
+      await setPhase($, 'discuss', models)
       $.ui.toast('💬 계획서 작성 완료 · 토론 모드. 질문하세요. 승인은 /plan-go')
       const where = file ? ` at ${file}` : ''
+      const present = presentPlanInstruction(showPlan, file)
       return {
         deny: [
           `plan-discuss: the plan is NOT approved yet, and the user wants to review and discuss it before approving.`,
           `Do NOT call ExitPlanMode again, and do not edit the plan file further in this turn.`,
-          `End your turn now with a short message in the user's language: the plan is written${where} and ready for discussion.`,
-          `Tell the user they can ask questions about it, run /plan-edit <instruction> to have it revised, or /plan-go to approve it and start implementation.`,
-        ].join(' '),
+          `End your turn now, in the user's language: say in one line that the plan is written${where} and ready for discussion.`,
+          present,
+          `Finish by telling the user they can ask questions about it, run /plan-edit <instruction> to have it revised, or /plan-go to approve it and start implementation.`,
+        ].filter(Boolean).join(' '),
       }
     }
 
@@ -200,7 +333,7 @@ export const register: Register = (on, options) => {
     if (ran.deny === undefined && ran.isError === undefined) {
       await update($, inPlan, () => false)
       await update($, returnToDiscuss, () => false)
-      await setPhase($, 'off')
+      await setPhase($, 'off', models)
       if (ph === 'approved') $.ui.toast('▶ 계획 승인 완료 · 구현 시작')
     }
     return ran
@@ -250,7 +383,7 @@ export const register: Register = (on, options) => {
   on('turn.complete', async ($, e, next) => {
     if (e.agentId === undefined && (await read($, returnToDiscuss))) {
       await update($, returnToDiscuss, () => false)
-      if (await read($, inPlan)) await setPhase($, 'discuss')
+      if (await read($, inPlan)) await setPhase($, 'discuss', models)
     }
     return next(e)
   })
@@ -258,11 +391,12 @@ export const register: Register = (on, options) => {
   // ---- the band above the prompt ---------------------------------------
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
-    const [isIn, ph, hidden, file] = await Promise.all([
+    const [isIn, ph, hidden, file, applied] = await Promise.all([
       read($, inPlan),
       read($, phase),
       read($, isHidden),
       read($, planFile),
+      read($, appliedModel),
     ])
     if (e.props.hasSurvey || !isIn || ph === 'off' || hidden) return next(e)
 
@@ -285,6 +419,7 @@ export const register: Register = (on, options) => {
             {headline}
           </Text>
           {name && <Text dimColor> · {name}</Text>}
+          {applied && <Text dimColor> · 모델 {applied}</Text>}
         </Box>
         <Box>
           {ph !== 'discuss' && (
@@ -294,7 +429,7 @@ export const register: Register = (on, options) => {
               hotkey="t"
               onPress={async () => {
                 await update($, returnToDiscuss, () => false)
-                await setPhase($, 'discuss')
+                await setPhase($, 'discuss', models)
               }}
             />
           )}
@@ -305,7 +440,7 @@ export const register: Register = (on, options) => {
               hotkey="e"
               onPress={async () => {
                 await update($, returnToDiscuss, () => false)
-                await setPhase($, 'edit')
+                await setPhase($, 'edit', models)
               }}
             />
           )}
@@ -317,13 +452,14 @@ export const register: Register = (on, options) => {
               variant="primary"
               onPress={async () => {
                 await update($, returnToDiscuss, () => false)
-                await setPhase($, 'approved')
+                const switchModel = await setPhase($, 'approved', models, false)
+                if (switchModel) await switchModel()
                 void $.prompt.submit({ text: approvePrompt(''), asUser: true })
               }}
             />
           )}
           <Button key="hide" label="숨기기" onPress={() => update($, isHidden, () => true)} />
-          <Text dimColor> /plan-talk · /plan-edit [지시] · /plan-go [지시]</Text>
+          <Text dimColor> /plan-talk · /plan-edit [지시] · /plan-go [지시] · /plan-model [모델]</Text>
         </Box>
       </Box>
     )
