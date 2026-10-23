@@ -1,6 +1,6 @@
 {
   "name": "plan-discuss",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Plan mode에서 계획서 작성 후 질문/토론 단계를 거친 뒤 /plan-go로 승인하고 auto 모드로 실행하는 mod",
   "types": "./types/index.d.ts",
   "userConfig": {

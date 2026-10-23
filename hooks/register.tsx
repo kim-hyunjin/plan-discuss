@@ -63,6 +63,18 @@ function editPrompt(instruction: string): string {
   ].join('\n')
 }
 
+// command.run 훅 안에서 바로 $.prompt.submit을 부르면 프롬프트가 턴을 열지 못하고 사라진다.
+// 명령이 끝난 뒤 타이머에서 보내고, 그래도 들어가지 않으면 입력창에 채워 Enter만 누르게 한다.
+function submitAfterCommand($: Pick<EngineInterface, 'clock' | 'prompt' | 'ui'>, text: string): void {
+  void $.clock.after(50, async () => {
+    const res = await $.prompt.submit({ text, asUser: true }).catch((err: unknown) => ({ drop: String(err) }))
+    if (res.drop !== undefined) {
+      await $.prompt.fill({ text })
+      $.ui.toast(`plan-discuss: 프롬프트가 자동으로 들어가지 않았습니다 (${res.drop}). 입력창에서 Enter를 누르세요.`)
+    }
+  })
+}
+
 export const register: Register = (on, options) => {
   const approveMode = String(options.approveMode ?? 'auto')
   const interceptExit = options.interceptExit !== false
@@ -112,7 +124,7 @@ export const register: Register = (on, options) => {
       return { text: '✎ 계획 수정 모드. 이제 하는 말은 계획서 수정 지시로 처리됩니다. 토론으로 돌아가려면 /plan-talk.' }
     }
     await update($, returnToDiscuss, () => true)
-    void $.prompt.submit({ text: editPrompt(instruction), asUser: true })
+    submitAfterCommand($, editPrompt(instruction))
     return { text: '✎ 계획서를 한 번 수정하고 토론 모드로 돌아옵니다.' }
   })
 
@@ -122,7 +134,7 @@ export const register: Register = (on, options) => {
     }
     await update($, returnToDiscuss, () => false)
     await setPhase($, 'approved')
-    void $.prompt.submit({ text: approvePrompt(e.args), asUser: true })
+    submitAfterCommand($, approvePrompt(e.args))
     const how = approveMode === 'dialog' ? '승인 다이얼로그가 뜹니다' : `${approveMode} 모드로 전환되어 구현이 시작됩니다`
     return { text: `▶ 계획 승인. ExitPlanMode 후 ${how}.` }
   })
