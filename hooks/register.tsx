@@ -19,7 +19,15 @@ const modelOverrides = atom(
   { discuss: null, edit: null } as PlanModelOverrides,
 )
 
+/** 계획서 패널이 그리는 계획서 내용. 진입·수정·턴 종료 때 파일에서 다시 읽는다 */
+const planText = atom({ plugin: 'plan-discuss', key: 'planText' } as const, null as string | null)
+/** 계획서 패널이 편집 칸을 보여주는 중인지 */
+const isEditingPlan = atom({ plugin: 'plan-discuss', key: 'isEditingPlan' } as const, false)
+/** 사용자가 패널에서 계획서를 직접 고쳤고, 모델이 아직 그걸 모르는지 */
+const userEditedPlan = atom({ plugin: 'plan-discuss', key: 'userEditedPlan' } as const, false)
+
 const EDIT_TOOLS = /^(Write|Edit|MultiEdit|NotebookEdit)$/
+const PLAN_PANE = 'plan'
 
 const DISCUSS_CONTEXT = [
   '[plan-discuss] PLAN DISCUSSION MODE is on.',
@@ -31,6 +39,9 @@ const DISCUSS_CONTEXT = [
   '- Keep the plan file path in mind; quote the relevant section when it helps.',
   'Reply in the language the user writes in.',
 ].join('\n')
+
+const USER_EDITED_CONTEXT =
+  '[plan-discuss] The user edited the plan file directly since your last turn. Re-read the plan file before answering; do not rely on the version you remember.'
 
 const EDIT_CONTEXT = [
   '[plan-discuss] PLAN EDIT MODE is on.',
@@ -134,6 +145,24 @@ async function readPlanText($: Pick<EngineInterface, 'fs'>, file: string | null)
   }
 }
 
+function samePath(a: string, b: string): boolean {
+  const norm = (p: string) => p.replace(/\\/g, '/').toLowerCase()
+  return norm(a) === norm(b)
+}
+
+/** 계획서 파일을 다시 읽어 패널에 반영한다 */
+async function refreshPlan($: Pick<EngineInterface, 'fs' | 'state'>): Promise<void> {
+  const text = await readPlanText($, await read($, planFile))
+  await update($, planText, () => text)
+}
+
+async function openPlanPane($: Pick<EngineInterface, 'fs' | 'state' | 'ui'>): Promise<boolean> {
+  await refreshPlan($)
+  const name = (await read($, planFile))?.split(/[\\/]/).pop()
+  const opened = await $.ui.open({ id: PLAN_PANE, title: name ? `계획서 · ${name}` : '계획서' })
+  return opened.isPlaced
+}
+
 function approvePrompt(note: string): string {
   const extra = note.trim() ? `\n\n추가 지시: ${note.trim()}` : ''
   return [
@@ -175,6 +204,7 @@ export const register: Register = (on, options) => {
     edit: String(options.editModel ?? ''),
   }
   const showPlan: ShowPlan = showPlanRaw === 'summary' || showPlanRaw === 'off' ? showPlanRaw : 'full'
+  const planPane = options.planPane !== false
 
   // ---- commands --------------------------------------------------------
 
@@ -199,6 +229,10 @@ export const register: Register = (on, options) => {
         description: `계획 승인: ExitPlanMode 후 ${approveMode === 'dialog' ? '승인 다이얼로그' : approveMode + ' 모드'}로 구현 시작`,
         argumentHint: '[추가 지시]',
       }),
+      $.command.register({
+        name: 'plan-view',
+        description: '계획서를 옆 패널로 열기 (열려 있으면 닫기)',
+      }),
     ])
     await showStatus($)
     return next(e)
@@ -212,6 +246,8 @@ export const register: Register = (on, options) => {
     await setPhase($, 'discuss', models)
     const head = '💬 계획 토론 모드. 계획서에 대해 자유롭게 질문하세요. 계획서는 수정되지 않습니다. 수정은 /plan-edit, 승인은 /plan-go.'
     const file = await read($, planFile)
+    // 패널에 계획서가 보이면 대화창에 전문을 다시 찍지 않는다
+    if (planPane && (await openPlanPane($))) return { text: `${head}\n계획서는 옆 패널에 열었습니다 (/plan-view로 닫기).` }
     const plan = showPlan === 'off' ? null : await readPlanText($, file)
     if (plan === null) return { text: head }
     return { text: `${head}\n\n--- 계획서 (${file}) ---\n${plan}` }
@@ -270,6 +306,18 @@ export const register: Register = (on, options) => {
     return { text: `▶ 계획 승인. ExitPlanMode 후 ${how}.` }
   })
 
+  on('command.run', { command: 'plan-view' }, async $ => {
+    if ((await $.ui.panes()).some(p => p.id === PLAN_PANE)) {
+      await $.ui.close({ id: PLAN_PANE })
+      return { text: 'plan-discuss: 계획서 패널을 닫았습니다.' }
+    }
+    if ((await read($, planFile)) === null) {
+      return { text: 'plan-discuss: 아직 계획서 파일을 모릅니다. plan 모드에서 계획서가 작성된 뒤에 쓰세요.' }
+    }
+    await openPlanPane($)
+    return { text: 'plan-discuss: 계획서를 패널에 열었습니다.' }
+  })
+
   // ---- plan mode tracking ----------------------------------------------
 
   on('prompt.attachment', { type: 'plan_mode' }, async ($, e, next) => {
@@ -317,7 +365,10 @@ export const register: Register = (on, options) => {
       await setPhase($, 'discuss', models)
       $.ui.toast('💬 계획서 작성 완료 · 토론 모드. 질문하세요. 승인은 /plan-go')
       const where = file ? ` at ${file}` : ''
-      const present = presentPlanInstruction(showPlan, file)
+      const isInPane = planPane && (await openPlanPane($))
+      const present = isInPane
+        ? 'The plan is already shown to the user in a side pane, so do NOT print it in the chat; at most name its main sections in one line.'
+        : presentPlanInstruction(showPlan, file)
       return {
         deny: [
           `plan-discuss: the plan is NOT approved yet, and the user wants to review and discuss it before approving.`,
@@ -354,6 +405,14 @@ export const register: Register = (on, options) => {
 
   // ---- discuss mode: the plan file is read-only ------------------------
 
+  // 계획서가 수정되면 패널을 다시 그린다
+  on('tool.call', { tool: EDIT_TOOLS }, async ($, e, next) => {
+    const ran = await next(e)
+    const file = await read($, planFile)
+    if (file && 'file_path' in e && samePath(String(e.file_path), file)) await refreshPlan($).catch(() => {})
+    return ran
+  })
+
   on('tool.call', { tool: EDIT_TOOLS }, async ($, e, next) => {
     if (e.agentId !== undefined) return next(e)
     if (!(await read($, inPlan)) || (await read($, phase)) !== 'discuss') return next(e)
@@ -371,13 +430,14 @@ export const register: Register = (on, options) => {
     if (e.command !== undefined || e.isMeta === true) return next(e)
     if (!(await read($, inPlan))) return next(e)
     const ph = await read($, phase)
-    if (ph === 'discuss') {
-      return next({ ...e, context: [...(e.context ?? []), DISCUSS_CONTEXT] })
+    const context = [...(e.context ?? [])]
+    if (await read($, userEditedPlan)) {
+      await update($, userEditedPlan, () => false)
+      context.push(USER_EDITED_CONTEXT)
     }
-    if (ph === 'edit') {
-      return next({ ...e, context: [...(e.context ?? []), EDIT_CONTEXT] })
-    }
-    return next(e)
+    if (ph === 'discuss') context.push(DISCUSS_CONTEXT)
+    if (ph === 'edit') context.push(EDIT_CONTEXT)
+    return context.length === (e.context ?? []).length ? next(e) : next({ ...e, context })
   })
 
   on('turn.complete', async ($, e, next) => {
@@ -386,6 +446,78 @@ export const register: Register = (on, options) => {
       if (await read($, inPlan)) await setPhase($, 'discuss', models)
     }
     return next(e)
+  })
+
+  // ---- the plan pane ----------------------------------------------------
+
+  on('ui.render', { component: 'Pane', requestId: PLAN_PANE }, async ($, e) => {
+    const els = $.ui.resolve(e)
+    const { Box, Text, Button, Markdown } = els
+    const [text, file, editing, isIn] = await Promise.all([
+      read($, planText),
+      read($, planFile),
+      read($, isEditingPlan),
+      read($, inPlan),
+    ])
+    if (text === null || file === null) {
+      return <Text dimColor>{file ? `계획서를 읽을 수 없습니다: ${file}` : '아직 계획서가 없습니다.'}</Text>
+    }
+
+    // 편집 칸과 수정 지시 칸은 Input이 있는 화면에서만 (모바일은 읽기 전용)
+    if (!('Input' in els)) return <Markdown text={text} />
+    const { Input } = els
+
+    if (editing) {
+      const rows = Math.max(3, e.props.scroll.bodyRows - 3)
+      return (
+        <Box flexDirection="column">
+          <Box>
+            <Text color="planMode" bold>✎ 직접 편집 </Text>
+            <Text dimColor>Enter 저장 · Shift+Enter 줄바꿈 · </Text>
+            <Button key="cancel" label="취소" onPress={() => update($, isEditingPlan, () => false)} />
+          </Box>
+          <Input
+            key="plan-text"
+            value={text}
+            rows={rows}
+            submitLabel="저장"
+            autoFocus
+            onSubmit={async value => {
+              await $.fs.write(file, value.endsWith('\n') ? value : `${value}\n`)
+              await refreshPlan($)
+              await update($, isEditingPlan, () => false)
+              await update($, userEditedPlan, () => true)
+              $.ui.toast('plan-discuss: 계획서를 저장했습니다.')
+            }}
+          />
+        </Box>
+      )
+    }
+
+    return (
+      <Box flexDirection="column">
+        <Box>
+          <Button key="edit-direct" label="직접 편집" onPress={() => update($, isEditingPlan, () => true)} />
+          <Button key="reload" label="새로고침" onPress={() => refreshPlan($)} />
+        </Box>
+        {isIn && (
+          <Input
+            key="instruction"
+            label="수정 지시 "
+            placeholder="예: 3단계를 테스트 먼저 쓰는 순서로 바꿔줘"
+            submitLabel="AI로 수정"
+            onSubmit={async value => {
+              if (value.trim() === '') return
+              await update($, returnToDiscuss, () => true)
+              const switchModel = await setPhase($, 'edit', models, false)
+              if (switchModel) await switchModel()
+              void $.prompt.submit({ text: editPrompt(value), asUser: true })
+            }}
+          />
+        )}
+        <Markdown text={text} />
+      </Box>
+    )
   })
 
   // ---- the band above the prompt ---------------------------------------
@@ -458,8 +590,9 @@ export const register: Register = (on, options) => {
               }}
             />
           )}
+          <Button key="view" label="계획서 패널" hotkey="p" onPress={() => openPlanPane($)} />
           <Button key="hide" label="숨기기" onPress={() => update($, isHidden, () => true)} />
-          <Text dimColor> /plan-talk · /plan-edit [지시] · /plan-go [지시] · /plan-model [모델]</Text>
+          <Text dimColor> /plan-talk · /plan-edit [지시] · /plan-go [지시] · /plan-view · /plan-model [모델]</Text>
         </Box>
       </Box>
     )

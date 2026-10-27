@@ -15,6 +15,9 @@ declare module 'claude-code' {
       appliedModel: string | null
       savedModel: string | null
       modelOverrides: PlanModelOverrides
+      planText: string | null
+      isEditingPlan: boolean
+      userEditedPlan: boolean
     }
   }
 }

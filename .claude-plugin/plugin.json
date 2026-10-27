@@ -1,6 +1,6 @@
 {
   "name": "plan-discuss",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Plan mode에서 계획서 작성 후 질문/토론 단계를 거친 뒤 /plan-go로 승인하고 auto 모드로 실행하는 mod",
   "types": "./types/index.d.ts",
   "userConfig": {
@@ -29,6 +29,12 @@
       "default": "full",
       "options": ["full", "summary", "off"],
       "title": "토론 모드 진입 시 계획서 표시"
+    },
+    "planPane": {
+      "type": "boolean",
+      "description": "토론 모드로 들어갈 때 계획서를 옆 패널(pane)에 띄울지. 끄더라도 /plan-view나 밴드의 버튼으로 열 수 있음",
+      "default": true,
+      "title": "계획서 패널 자동으로 열기"
     },
     "discussModel": {
       "type": "string",
