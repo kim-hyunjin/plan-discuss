@@ -459,12 +459,25 @@ export const register: Register = (on, options) => {
       read($, isEditingPlan),
       read($, inPlan),
     ])
+    const closeButton = <Button key="close" label="닫기" onPress={() => $.ui.close({ id: PLAN_PANE })} />
     if (text === null || file === null) {
-      return <Text dimColor>{file ? `계획서를 읽을 수 없습니다: ${file}` : '아직 계획서가 없습니다.'}</Text>
+      return (
+        <Box flexDirection="column">
+          <Box>{closeButton}</Box>
+          <Text dimColor>{file ? `계획서를 읽을 수 없습니다: ${file}` : '아직 계획서가 없습니다.'}</Text>
+        </Box>
+      )
     }
 
     // 편집 칸과 수정 지시 칸은 Input이 있는 화면에서만 (모바일은 읽기 전용)
-    if (!('Input' in els)) return <Markdown text={text} />
+    if (!('Input' in els)) {
+      return (
+        <Box flexDirection="column">
+          <Box>{closeButton}</Box>
+          <Markdown text={text} />
+        </Box>
+      )
+    }
     const { Input } = els
 
     if (editing) {
@@ -499,6 +512,7 @@ export const register: Register = (on, options) => {
         <Box>
           <Button key="edit-direct" label="직접 편집" onPress={() => update($, isEditingPlan, () => true)} />
           <Button key="reload" label="새로고침" onPress={() => refreshPlan($)} />
+          {closeButton}
         </Box>
         {isIn && (
           <Input
